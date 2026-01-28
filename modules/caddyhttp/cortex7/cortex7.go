@@ -12,6 +12,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -39,13 +40,15 @@ type Handler struct {
 	SensitiveLimit   int64            `json:"sensitive_limit,omitempty"`
 	SensitiveLimits  map[string]int64 `json:"sensitive_limits,omitempty"`
 	GeneralPrefix    string           `json:"general_prefix,omitempty"`
-	GeneralLimit     int64            `json:"general_limit,omitempty"`
+	GeneralLimit     *int64           `json:"general_limit,omitempty"` // nil = default 120, 0 = disable
+	RateLimitWindow  caddy.Duration   `json:"rate_limit_window,omitempty"` // bucket window for general/sensitive/per-host/fingerprint/uniqueURL; default 1m
 	FailedAuthLimit  int64            `json:"failed_auth_limit,omitempty"`
 	BlockDuration    caddy.Duration   `json:"block_duration,omitempty"`
 	BlockDurationAuth caddy.Duration  `json:"block_duration_failed_auth,omitempty"`
 
 	RealIPHeaderCF     string `json:"real_ip_cf_header,omitempty"`
 	RealIPHeaderCustom string `json:"real_ip_custom_header,omitempty"`
+	RealIPXFFMode      string `json:"real_ip_xff_mode,omitempty"` // "first" (default) or "last"
 
 	JSChallenge   bool   `json:"js_challenge,omitempty"`
 	ChallengePath string `json:"challenge_path,omitempty"`
@@ -54,6 +57,8 @@ type Handler struct {
 	// challenge token: server-side store, unique per session, not derivable
 	ChallengeTokenTTL           caddy.Duration `json:"challenge_token_ttl,omitempty"`
 	ChallengeStoreResetInterval caddy.Duration `json:"challenge_store_reset_interval,omitempty"`
+	ChallengePathLimit          int64         `json:"challenge_path_limit,omitempty"`   // requests/min per IP to challenge path; 0 = no limit
+	ChallengeStoreMaxSize       int64         `json:"challenge_store_max_size,omitempty"` // max tokens in store; 0 = no limit
 	// cookie options (configurable)
 	CookieSecure   bool   `json:"cookie_secure,omitempty"`
 	CookieSameSite string `json:"cookie_same_site,omitempty"` // Strict, Lax, None, ""
@@ -69,6 +74,13 @@ type Handler struct {
 
 	BlockRefererList []string `json:"block_referer_list,omitempty"`
 	CloseNoBody      bool     `json:"close_no_body,omitempty"`
+	// reject response: status code (default 444); max_body uses max_body_reject_code (default 413)
+	RejectStatusCode   int `json:"reject_status_code,omitempty"`
+	MaxBodyRejectCode  int `json:"max_body_reject_code,omitempty"`
+	// custom reject: redirect (priority) or HTML body
+	RejectRedirectURL string `json:"reject_redirect_url,omitempty"`
+	RejectBody       string `json:"reject_body,omitempty"` // inline HTML or path to file
+	LogBlocks        bool   `json:"log_blocks,omitempty"`   // log reason, IP, path, method on block
 
 	WAFRules []WAFRule `json:"waf_rules,omitempty"`
 
@@ -78,6 +90,9 @@ type Handler struct {
 	BypassSecretCookie string `json:"bypass_secret_cookie,omitempty"` // cookie name
 	// allowlist IP/CIDR: skip all checks
 	AllowlistIPs []string `json:"allowlist_ips,omitempty"`
+	// blocklist from file: IP/CIDR per line, reload by interval
+	BlocklistFile           string        `json:"blocklist_file,omitempty"`
+	BlocklistReloadInterval caddy.Duration `json:"blocklist_reload_interval,omitempty"`
 	// honeypot: hit path -> block IP
 	HoneypotPaths    []string        `json:"honeypot_paths,omitempty"`
 	HoneypotDuration caddy.Duration  `json:"honeypot_block_duration,omitempty"`
@@ -120,10 +135,12 @@ type Handler struct {
 	challengePathLen int
 
 	allowlist     *allowlistChecker
+	blocklist     atomic.Pointer[allowlistChecker]
 	honeypotExact  map[string]struct{}
 	honeypotPrefix []string
 	trapBytes      [][]byte
 	badUABytes     [][]byte
+	rejectBodyBytes []byte // cached body for reject (from RejectBody inline or file)
 }
 
 // WAFRule is a single WAF rule.
@@ -157,8 +174,18 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.SensitiveLimit == 0 {
 		h.SensitiveLimit = 10
 	}
-	if h.GeneralLimit == 0 {
-		h.GeneralLimit = 120
+	if h.GeneralLimit == nil {
+		var v int64 = 120
+		h.GeneralLimit = &v
+	}
+	if h.RejectStatusCode == 0 {
+		h.RejectStatusCode = 444
+	}
+	if h.MaxBodyRejectCode == 0 {
+		h.MaxBodyRejectCode = 413
+	}
+	if h.RateLimitWindow == 0 {
+		h.RateLimitWindow = caddy.Duration(time.Minute)
 	}
 	if h.FailedAuthLimit == 0 {
 		h.FailedAuthLimit = 10
@@ -196,6 +223,16 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.CookiePath == "" {
 		h.CookiePath = "/"
 	}
+	if h.RejectBody != "" {
+		if strings.Contains(h.RejectBody, "<") {
+			h.rejectBodyBytes = []byte(h.RejectBody)
+		} else {
+			b, err := os.ReadFile(h.RejectBody)
+			if err == nil {
+				h.rejectBodyBytes = b
+			}
+		}
+	}
 	if h.HoneypotDuration == 0 {
 		h.HoneypotDuration = h.BlockDuration
 	}
@@ -205,6 +242,33 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		h.allowlist, err = buildAllowlist(h.AllowlistIPs)
 		if err != nil {
 			return err
+		}
+	}
+	// blocklist from file
+	if h.BlocklistFile != "" {
+		bl, err := loadBlocklistFromFile(h.BlocklistFile)
+		if err != nil {
+			h.logger.Warn("blocklist file load failed, skipping", zap.String("file", h.BlocklistFile), zap.Error(err))
+		} else {
+			h.blocklist.Store(bl)
+		}
+		if h.BlocklistReloadInterval > 0 {
+			iv := time.Duration(h.BlocklistReloadInterval)
+			if iv < time.Minute {
+				iv = time.Minute
+			}
+			path := h.BlocklistFile
+			go func() {
+				t := time.NewTicker(iv)
+				defer t.Stop()
+				for range t.C {
+					bl, err := loadBlocklistFromFile(path)
+					if err != nil {
+						continue
+					}
+					h.blocklist.Store(bl)
+				}
+			}()
 		}
 	}
 	// honeypot: exact + prefix
@@ -303,12 +367,16 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	// start prune loop
+	// start prune loop (use same window for rate-limit buckets)
+	pruneWindow := time.Duration(h.RateLimitWindow)
+	if pruneWindow < time.Second {
+		pruneWindow = time.Minute
+	}
 	go func() {
 		t := time.NewTicker(2 * time.Minute)
 		defer t.Stop()
 		for range t.C {
-			h.store.prune()
+			h.store.prune(pruneWindow)
 		}
 	}()
 	// challenge token store reset (configurable, default 10m): all cookies invalid, re-challenge
@@ -328,8 +396,11 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 // Validate checks config.
 func (h *Handler) Validate() error {
-	if h.SensitiveLimit < 1 || h.GeneralLimit < 1 {
-		return fmt.Errorf("sensitive_limit and general_limit must be >= 1")
+	if h.SensitiveLimit < 1 {
+		return fmt.Errorf("sensitive_limit must be >= 1")
+	}
+	if h.GeneralLimit != nil && *h.GeneralLimit < 0 {
+		return fmt.Errorf("general_limit must be >= 0 (0 = disable)")
 	}
 	if h.JSChallenge && h.ChallengeTokenTTL < caddy.Duration(time.Second) {
 		return fmt.Errorf("challenge_token_ttl must be >= 1s when js_challenge enabled")
@@ -353,24 +424,31 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	path := r.URL.Path
 	pathLen := len(path)
 
-	// bypass: secret in header or cookie
+	// bypass: secret in header or cookie (constant-time compare)
 	if h.BypassSecret != "" {
-		if h.BypassSecretHeader != "" && r.Header.Get(h.BypassSecretHeader) == h.BypassSecret {
-			return next.ServeHTTP(w, r)
+		if h.BypassSecretHeader != "" {
+			if subtleCompare(r.Header.Get(h.BypassSecretHeader), h.BypassSecret) {
+				return next.ServeHTTP(w, r)
+			}
 		}
 		if h.BypassSecretCookie != "" {
-			if c, _ := r.Cookie(h.BypassSecretCookie); c != nil && c.Value == h.BypassSecret {
+			if c, _ := r.Cookie(h.BypassSecretCookie); c != nil && subtleCompare(c.Value, h.BypassSecret) {
 				return next.ServeHTTP(w, r)
 			}
 		}
 	}
 
-	// tick global counter, get current minute bucket (one time.Now() for both)
+	// tick global counter (1m for auto_enable), rate-limit bucket (configurable window)
 	now := time.Now()
-	bucketMin := now.Unix() / 60
+	minuteBucket := now.Unix() / 60
+	window := time.Duration(h.RateLimitWindow)
+	if window < time.Second {
+		window = time.Minute
+	}
+	bucketMin := now.Truncate(window).Unix()
 	lm := h.lastMinute.Load()
-	if lm != bucketMin {
-		if h.lastMinute.CompareAndSwap(lm, bucketMin) && lm != 0 {
+	if lm != minuteBucket {
+		if h.lastMinute.CompareAndSwap(lm, minuteBucket) && lm != 0 {
 			c := h.globalReqs.Swap(0)
 			if h.AutoEnable {
 				if !h.Enabled && !h.autoEnabled.Load() && c >= h.AutoThresholdEnable {
@@ -412,7 +490,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	if ok, _ := h.store.isBlocked(ip); ok {
-		h.reject(w, r)
+		h.rejectWithReason(w, r, "blocked")
+		return nil
+	}
+	if bl := h.blocklist.Load(); bl != nil && bl.contains(ip) {
+		h.rejectWithReason(w, r, "blocklist")
 		return nil
 	}
 
@@ -420,14 +502,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	for _, b := range h.trapBytes {
 		if indexBytes(*(*[]byte)(unsafe.Pointer(&path)), b) >= 0 {
 			h.store.block(ip, "trap_path", time.Duration(h.HoneypotDuration))
-			h.reject(w, r)
+			h.rejectWithReason(w, r, "trap_path")
 			return nil
 		}
 	}
 
 	// max body
 	if h.MaxBodyBytes > 0 && r.ContentLength > h.MaxBodyBytes {
-		h.reject(w, r)
+		h.rejectWithCode(w, r, h.maxBodyRejectCode(), "max_body")
 		return nil
 	}
 
@@ -435,18 +517,26 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		ref := r.Header.Get("Referer")
 		for _, block := range h.BlockRefererList {
 			if strings.Contains(ref, block) {
-				h.reject(w, r)
+				h.rejectWithReason(w, r, "block_referer")
 				return nil
 			}
 		}
 	}
 
-	// WAF: precompiled byte contains
+	// WAF: precompiled byte contains; action block | challenge
 	pathB := *(*[]byte)(unsafe.Pointer(&path))
 	for i, b := range h.wafPathBytes {
 		if indexBytes(pathB, b) >= 0 {
-			h.store.block(ip, "waf:"+h.WAFRules[h.wafRuleIdxPath[i]].ID, time.Duration(h.BlockDuration))
-			h.reject(w, r)
+			rule := h.WAFRules[h.wafRuleIdxPath[i]]
+			if strings.EqualFold(rule.Action, "challenge") {
+				cookie, _ := r.Cookie(h.CookieName)
+				if h.verifyChallengeCookie(cookie, ip) {
+					continue
+				}
+				return h.serveChallengePage(w, r)
+			}
+			h.store.block(ip, "waf:"+rule.ID, time.Duration(h.BlockDuration))
+			h.rejectWithReason(w, r, "waf:"+rule.ID)
 			return nil
 		}
 	}
@@ -454,22 +544,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	queryB := *(*[]byte)(unsafe.Pointer(&query))
 	for i, b := range h.wafQueryBytes {
 		if indexBytes(queryB, b) >= 0 {
-			h.store.block(ip, "waf:"+h.WAFRules[h.wafRuleIdxQuery[i]].ID, time.Duration(h.BlockDuration))
-			h.reject(w, r)
+			rule := h.WAFRules[h.wafRuleIdxQuery[i]]
+			if strings.EqualFold(rule.Action, "challenge") {
+				cookie, _ := r.Cookie(h.CookieName)
+				if h.verifyChallengeCookie(cookie, ip) {
+					continue
+				}
+				return h.serveChallengePage(w, r)
+			}
+			h.store.block(ip, "waf:"+rule.ID, time.Duration(h.BlockDuration))
+			h.rejectWithReason(w, r, "waf:"+rule.ID)
 			return nil
 		}
 	}
 	for i, b := range h.wafHeaderBytes {
 		if wafHeaderContains(r, b) {
-			h.store.block(ip, "waf:"+h.WAFRules[h.wafRuleIdxHeader[i]].ID, time.Duration(h.BlockDuration))
-			h.reject(w, r)
+			rule := h.WAFRules[h.wafRuleIdxHeader[i]]
+			if strings.EqualFold(rule.Action, "challenge") {
+				cookie, _ := r.Cookie(h.CookieName)
+				if h.verifyChallengeCookie(cookie, ip) {
+					continue
+				}
+				return h.serveChallengePage(w, r)
+			}
+			h.store.block(ip, "waf:"+rule.ID, time.Duration(h.BlockDuration))
+			h.rejectWithReason(w, r, "waf:"+rule.ID)
 			return nil
 		}
 	}
 
 	// bot checks: require UA, block bad UA, require Accept
 	if h.RequireUserAgent && r.UserAgent() == "" {
-		h.reject(w, r)
+		h.rejectWithReason(w, r, "no_user_agent")
 		return nil
 	}
 	ua := r.UserAgent()
@@ -477,31 +583,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	for _, b := range h.badUABytes {
 		if indexBytes(uaB, b) >= 0 {
 			h.store.block(ip, "bad_user_agent", time.Duration(h.BlockDuration))
-			h.reject(w, r)
+			h.rejectWithReason(w, r, "bad_user_agent")
 			return nil
 		}
 	}
 	if h.RequireAccept && r.Header.Get("Accept") == "" {
-		h.reject(w, r)
+		h.rejectWithReason(w, r, "no_accept")
 		return nil
 	}
 
 	// honeypot: hit path -> block IP
 	if _, ok := h.honeypotExact[path]; ok {
 		h.store.block(ip, "honeypot", time.Duration(h.HoneypotDuration))
-		h.reject(w, r)
+		h.rejectWithReason(w, r, "honeypot")
 		return nil
 	}
 	for _, p := range h.honeypotPrefix {
 		if pathLen >= len(p) && path[:len(p)] == p {
 			h.store.block(ip, "honeypot", time.Duration(h.HoneypotDuration))
-			h.reject(w, r)
+			h.rejectWithReason(w, r, "honeypot")
 			return nil
 		}
 	}
 
 	if h.JSChallenge && h.ChallengePath != "" {
 		if pathLen == h.challengePathLen && path == h.ChallengePath {
+			if h.ChallengePathLimit > 0 {
+				chKey := "challenge:" + ip
+				n := h.store.incReqKey(chKey, bucketMin)
+				if n > h.ChallengePathLimit {
+					h.rejectWithReason(w, r, "challenge_path_limit")
+					return nil
+				}
+			}
 			return h.serveChallenge(w, r, next)
 		}
 		cookie, _ := r.Cookie(h.CookieName)
@@ -519,7 +633,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		n := h.store.incReqPath(ip, path, bucketMin)
 		if n > limit {
 			h.store.block(ip, "rate_limit_sensitive", time.Duration(h.BlockDuration))
-			h.reject(w, r)
+			h.rejectWithReason(w, r, "rate_limit_sensitive")
 			return nil
 		}
 	} else {
@@ -531,7 +645,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				n := h.store.incReqPath(ip, path, bucketMin)
 				if n > limit {
 					h.store.block(ip, "rate_limit_sensitive", time.Duration(h.BlockDuration))
-					h.reject(w, r)
+					h.rejectWithReason(w, r, "rate_limit_sensitive")
 					return nil
 				}
 				break
@@ -545,7 +659,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		n := h.store.incReqKey(hostKey, bucketMin)
 		if n > h.PerHostLimit {
 			h.store.block(ip, "rate_limit_per_host", time.Duration(h.BlockDuration))
-			h.reject(w, r)
+			h.rejectWithReason(w, r, "rate_limit_per_host")
 			return nil
 		}
 	}
@@ -557,7 +671,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		n := h.store.incReqKey(fpKey, bucketMin)
 		if n > h.FingerprintLimit {
 			h.store.block(ip, "rate_limit_fingerprint", time.Duration(h.BlockDuration))
-			h.reject(w, r)
+			h.rejectWithReason(w, r, "rate_limit_fingerprint")
 			return nil
 		}
 	}
@@ -571,19 +685,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		n := h.store.addUniqueURL(ip, pathQuery, bucketMin)
 		if n > h.MaxUniqueURLsPerMinute {
 			h.store.block(ip, "rate_limit_unique_url", time.Duration(h.BlockDuration))
-			h.reject(w, r)
+			h.rejectWithReason(w, r, "rate_limit_unique_url")
 			return nil
 		}
 	}
 
-	// general rate limit
-	useGeneral := h.generalPrefixLen == 0 || (pathLen >= h.generalPrefixLen && path[:h.generalPrefixLen] == h.GeneralPrefix)
-	if useGeneral {
-		n := h.store.incReq(ip, bucketMin)
-		if n > h.GeneralLimit {
-			h.store.block(ip, "rate_limit_general", time.Duration(h.BlockDuration))
-			h.reject(w, r)
-			return nil
+	// general rate limit (0 = disabled)
+	if gl := h.getGeneralLimit(); gl > 0 {
+		useGeneral := h.generalPrefixLen == 0 || (pathLen >= h.generalPrefixLen && path[:h.generalPrefixLen] == h.GeneralPrefix)
+		if useGeneral {
+			n := h.store.incReq(ip, bucketMin)
+			if n > gl {
+				h.store.block(ip, "rate_limit_general", time.Duration(h.BlockDuration))
+				h.rejectWithReason(w, r, "rate_limit_general")
+				return nil
+			}
 		}
 	}
 
@@ -620,14 +736,70 @@ func wafHeaderContains(r *http.Request, needle []byte) bool {
 }
 
 func (h *Handler) realIP(r *http.Request) string {
-	return realIPFromHeaders(h.RealIPHeaderCF, h.RealIPHeaderCustom, "X-Forwarded-For", r.Header.Get)
+	xffLast := strings.EqualFold(h.RealIPXFFMode, "last")
+	return realIPFromHeaders(h.RealIPHeaderCF, h.RealIPHeaderCustom, "X-Forwarded-For", xffLast, r.Header.Get)
 }
 
 func (h *Handler) reject(w http.ResponseWriter, r *http.Request) {
+	h.rejectWithReason(w, r, "")
+}
+
+func (h *Handler) rejectWithReason(w http.ResponseWriter, r *http.Request, reason string) {
+	h.rejectWithCode(w, r, h.rejectStatusCode(), reason)
+}
+
+func (h *Handler) rejectWithCode(w http.ResponseWriter, r *http.Request, code int, reason string) {
+	if h.LogBlocks && reason != "" {
+		h.logBlock(r, reason)
+	}
 	h.responseJitter()
+	if code <= 0 {
+		code = 444
+	}
+	if h.RejectRedirectURL != "" {
+		w.Header().Set("Location", h.RejectRedirectURL)
+		w.WriteHeader(http.StatusFound)
+		return
+	}
+	if len(h.rejectBodyBytes) > 0 {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(code)
+		_, _ = w.Write(h.rejectBodyBytes)
+		return
+	}
 	r.Close = true
 	w.Header().Set("Connection", "close")
-	w.WriteHeader(444)
+	w.WriteHeader(code)
+}
+
+func (h *Handler) logBlock(r *http.Request, reason string) {
+	ip := h.realIP(r)
+	if ip == "" {
+		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
+	}
+	ip = trimIPv4Mapping(ip)
+	h.logger.Info("cortex7 block", zap.String("reason", reason), zap.String("ip", ip), zap.String("path", r.URL.Path), zap.String("method", r.Method))
+}
+
+func (h *Handler) rejectStatusCode() int {
+	if h.RejectStatusCode <= 0 {
+		return 444
+	}
+	return h.RejectStatusCode
+}
+
+func (h *Handler) maxBodyRejectCode() int {
+	if h.MaxBodyRejectCode <= 0 {
+		return 413
+	}
+	return h.MaxBodyRejectCode
+}
+
+func (h *Handler) getGeneralLimit() int64 {
+	if h.GeneralLimit == nil {
+		return 120
+	}
+	return *h.GeneralLimit
 }
 
 // responseJitter adds random delay to thwart timing/bot fingerprinting
@@ -669,7 +841,10 @@ func (h *Handler) serveChallenge(w http.ResponseWriter, r *http.Request, next ca
 	}
 	sessionToken := hex.EncodeToString(raw)
 	until := time.Now().Add(time.Duration(h.ChallengeTokenTTL)).UnixNano()
-	h.store.setChallengeToken(sessionToken, ip, until)
+	if !h.store.setChallengeToken(sessionToken, ip, until, h.ChallengeStoreMaxSize) {
+		h.rejectWithReason(w, r, "challenge_store_full")
+		return nil
+	}
 	cookie := h.buildChallengeCookie(sessionToken, r)
 	http.SetCookie(w, cookie)
 	w.Header().Set("Location", "/")

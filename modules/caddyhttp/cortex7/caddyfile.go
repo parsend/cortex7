@@ -57,7 +57,13 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 			}
 		case "general_limit":
 			if h.NextArg() {
-				handler.GeneralLimit, _ = strconv.ParseInt(h.Val(), 10, 64)
+				n, _ := strconv.ParseInt(h.Val(), 10, 64)
+				handler.GeneralLimit = &n
+			}
+		case "rate_limit_window":
+			if h.NextArg() {
+				d, _ := parseDuration(h.Val())
+				handler.RateLimitWindow = caddy.Duration(d)
 			}
 		case "failed_auth_limit":
 			if h.NextArg() {
@@ -79,6 +85,28 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 			if h.NextArg() {
 				handler.RealIPHeaderCustom = h.Val()
 			}
+		case "real_ip_xff_mode":
+			if h.NextArg() {
+				handler.RealIPXFFMode = h.Val()
+			}
+		case "reject_status_code":
+			if h.NextArg() {
+				n, _ := strconv.Atoi(h.Val())
+				handler.RejectStatusCode = n
+			}
+		case "max_body_reject_code":
+			if h.NextArg() {
+				n, _ := strconv.Atoi(h.Val())
+				handler.MaxBodyRejectCode = n
+			}
+		case "reject_redirect_url":
+			if h.NextArg() {
+				handler.RejectRedirectURL = h.Val()
+			}
+		case "reject_body":
+			if h.NextArg() {
+				handler.RejectBody = h.Val()
+			}
 		case "js_challenge":
 			handler.JSChallenge = true
 			if h.NextArg() {
@@ -87,6 +115,14 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 		case "challenge_path":
 			if h.NextArg() {
 				handler.ChallengePath = h.Val()
+			}
+		case "challenge_path_limit":
+			if h.NextArg() {
+				handler.ChallengePathLimit, _ = strconv.ParseInt(h.Val(), 10, 64)
+			}
+		case "challenge_store_max_size":
+			if h.NextArg() {
+				handler.ChallengeStoreMaxSize, _ = strconv.ParseInt(h.Val(), 10, 64)
 			}
 		case "cookie_name":
 			if h.NextArg() {
@@ -143,14 +179,20 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				id := h.Val()
 				typ := "path"
 				match := ""
+				action := "block"
 				if h.NextArg() {
 					typ = h.Val()
 				}
 				if h.NextArg() {
 					match = h.Val()
 				}
-				handler.WAFRules = append(handler.WAFRules, WAFRule{ID: id, Type: typ, Match: match, Action: "block"})
+				if h.NextArg() {
+					action = h.Val()
+				}
+				handler.WAFRules = append(handler.WAFRules, WAFRule{ID: id, Type: typ, Match: match, Action: action})
 			}
+		case "log_blocks":
+			handler.LogBlocks = true
 		case "bypass_secret":
 			if h.NextArg() {
 				handler.BypassSecret = h.Val()
@@ -166,6 +208,15 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 		case "allowlist_ips":
 			for h.NextArg() {
 				handler.AllowlistIPs = append(handler.AllowlistIPs, h.Val())
+			}
+		case "blocklist_file":
+			if h.NextArg() {
+				handler.BlocklistFile = h.Val()
+			}
+		case "blocklist_reload_interval":
+			if h.NextArg() {
+				d, _ := parseDuration(h.Val())
+				handler.BlocklistReloadInterval = caddy.Duration(d)
 			}
 		case "honeypot_paths":
 			for h.NextArg() {

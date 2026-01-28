@@ -82,18 +82,29 @@ Put `cortex7` first in your `handle` block so it runs before other handlers.
 | `sensitive_paths` | paths... | Paths with stricter per-path limit |
 | `sensitive_limit` | N | Requests/min per sensitive path |
 | `general_prefix` | prefix | Apply general limit only to this path prefix (empty = all) |
-| `general_limit` | N | Requests/min per IP (general) |
+| `general_limit` | N | Requests/min per IP (general); 0 = disable |
+| `rate_limit_window` | duration | Bucket window for rate limits (default 1m) |
 | `failed_auth_limit` | N | Failed auth events in 15 min → block |
 | `block_duration` | duration | Block TTL for rate-limit hits |
 | `block_duration_failed_auth` | duration | Block TTL for failed-auth |
+| `reject_status_code` | N | Status code on block (default 444) |
+| `max_body_reject_code` | N | Status code when max body exceeded (default 413) |
+| `reject_redirect_url` | url | Redirect to URL instead of 444/403 |
+| `reject_body` | path or HTML | Custom HTML body or path to file |
+| `log_blocks` | - | Log reason, IP, path, method on block |
 | `real_ip_cf` | - | Use Cf-Connecting-Ip |
 | `real_ip_header` | name | Use custom header for client IP |
+| `real_ip_xff_mode` | first\|last | X-Forwarded-For: first (default) or last IP |
 | `js_challenge` | [path] | Enable JS challenge; optional path |
 | `challenge_path` | path | Challenge URL path (default `/.c7c`) |
+| `challenge_path_limit` | N | Requests/min per IP to challenge path; 0 = no limit |
+| `challenge_store_max_size` | N | Max tokens in store; 0 = no limit |
 | `cookie_name` | name | Challenge cookie name |
 | `close_no_body` | - | 444 with no body (fewer browser retries) |
+| `blocklist_file` | path | File with IP/CIDR per line (block list) |
+| `blocklist_reload_interval` | duration | Reload blocklist file interval |
 | `block_referer` | substrings... | Block request if Referer contains any |
-| `waf_rule` | id type match | type: path, query, header; match: substring |
+| `waf_rule` | id type match [action] | type: path, query, header; action: block (default) or challenge |
 
 ---
 

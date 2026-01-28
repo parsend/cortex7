@@ -3,7 +3,9 @@
 package cortex7
 
 import (
+	"bufio"
 	"net/netip"
+	"os"
 	"strings"
 )
 
@@ -41,7 +43,31 @@ func firstIP(s string) string {
 	return s
 }
 
-func realIPFromHeaders(headerCf, headerCustom, headerXFF string, getHeader func(string) string) string {
+// lastIP returns last IP from comma-separated list (e.g. client in some CDN setups).
+func lastIP(s string) string {
+	for len(s) > 0 && (s[len(s)-1] == ' ' || s[len(s)-1] == '\t') {
+		s = s[:len(s)-1]
+	}
+	if len(s) == 0 {
+		return ""
+	}
+	idx := strings.LastIndexByte(s, ',')
+	if idx >= 0 {
+		s = s[idx+1:]
+		for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
+			s = s[1:]
+		}
+	}
+	if len(s) == 0 {
+		return ""
+	}
+	if _, err := netip.ParseAddr(s); err != nil {
+		return ""
+	}
+	return s
+}
+
+func realIPFromHeaders(headerCf, headerCustom, headerXFF string, xffUseLast bool, getHeader func(string) string) string {
 	if headerCf != "" {
 		if v := getHeader("Cf-Connecting-Ip"); v != "" {
 			ip := firstIP(v)
@@ -60,7 +86,12 @@ func realIPFromHeaders(headerCf, headerCustom, headerXFF string, getHeader func(
 	}
 	if headerXFF != "" {
 		if v := getHeader("X-Forwarded-For"); v != "" {
-			ip := firstIP(v)
+			var ip string
+			if xffUseLast {
+				ip = lastIP(v)
+			} else {
+				ip = firstIP(v)
+			}
 			if ip != "" {
 				return trimIPv4Mapping(ip)
 			}
@@ -155,4 +186,26 @@ func (c *allowlistChecker) contains(ipStr string) bool {
 		}
 	}
 	return false
+}
+
+// loadBlocklistFromFile reads path (one IP or CIDR per line, # comment, blank skip), returns checker or error.
+func loadBlocklistFromFile(path string) (*allowlistChecker, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		s := strings.TrimSpace(sc.Text())
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		lines = append(lines, s)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return buildAllowlist(lines)
 }

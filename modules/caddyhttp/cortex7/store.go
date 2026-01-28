@@ -4,6 +4,7 @@ package cortex7
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,7 +59,8 @@ func newShard() *shard {
 }
 
 type store struct {
-	shards [shardCount]*shard
+	shards             [shardCount]*shard
+	challengeTokenCount atomic.Int64
 }
 
 func newStore() *store {
@@ -195,12 +197,21 @@ func hashPathQuery(s string) uint64 {
 	return h
 }
 
-// setChallengeToken stores token bound to IP and expiry (one token per session, not derivable)
-func (s *store) setChallengeToken(token, ip string, until int64) {
+// setChallengeToken stores token bound to IP and expiry. maxSize 0 = no limit. returns false if at capacity.
+func (s *store) setChallengeToken(token, ip string, until int64, maxSize int64) bool {
 	sh := s.shardByKey(token)
 	sh.mu.Lock()
 	sh.challengeTokens[token] = challengeEntry{ip: ip, until: until}
 	sh.mu.Unlock()
+	n := s.challengeTokenCount.Add(1)
+	if maxSize > 0 && n > maxSize {
+		sh.mu.Lock()
+		delete(sh.challengeTokens, token)
+		sh.mu.Unlock()
+		s.challengeTokenCount.Add(-1)
+		return false
+	}
+	return true
 }
 
 // validateChallengeToken checks token exists, IP matches, not expired. constant-time path.
@@ -219,6 +230,7 @@ func (s *store) validateChallengeToken(token, ip string, nowNano int64) bool {
 		sh.mu.Lock()
 		delete(sh.challengeTokens, token)
 		sh.mu.Unlock()
+		s.challengeTokenCount.Add(-1)
 		return false
 	}
 	return constantTimeEqual(e.ip, ip)
@@ -236,13 +248,19 @@ func constantTimeEqual(a, b string) bool {
 }
 
 func (s *store) resetChallengeTokens() {
+	var removed int64
 	for i := 0; i < shardCount; i++ {
 		sh := s.shards[i]
 		sh.mu.Lock()
+		n := int64(len(sh.challengeTokens))
 		for k := range sh.challengeTokens {
 			delete(sh.challengeTokens, k)
 		}
 		sh.mu.Unlock()
+		removed += n
+	}
+	if removed > 0 {
+		s.challengeTokenCount.Add(-removed)
 	}
 }
 
@@ -260,9 +278,12 @@ func (s *store) addUniqueURL(ip, pathQuery string, bucketMin int64) int64 {
 	return int64(len(w.urls))
 }
 
-func (s *store) prune() {
+func (s *store) prune(rateLimitWindow time.Duration) {
 	now := time.Now()
-	bucketMin := now.Truncate(windowMinute).Unix()
+	if rateLimitWindow < time.Second {
+		rateLimitWindow = windowMinute
+	}
+	bucketMin := now.Truncate(rateLimitWindow).Unix()
 	bucketAuth := now.Truncate(windowAuth).Unix()
 	nowNano := now.UnixNano()
 	for i := 0; i < shardCount; i++ {
@@ -306,6 +327,7 @@ func (s *store) prune() {
 		for token, e := range sh.challengeTokens {
 			if nowNano >= e.until {
 				delete(sh.challengeTokens, token)
+				s.challengeTokenCount.Add(-1)
 			}
 		}
 		sh.mu.Unlock()
