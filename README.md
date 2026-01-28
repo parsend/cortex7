@@ -12,12 +12,15 @@ Based on [Caddy](https://github.com/caddyserver/caddy) v2. All Caddy features, d
 ## Cortex7 at a glance
 
 - **No Redis.** In-memory sharded store (256 shards).
-- **RealIP:** Cf-Connecting-Ip, custom header, X-Forwarded-For.
-- **Rate limits:** per-IP general limit, per-path sensitive limit, failed-auth limit with block.
-- **Block list:** blocked IPs get 444 + `Connection: close` (optionally no body to reduce browser retries).
-- **WAF:** path/query/header substring rules, block or challenge.
-- **JS challenge:** optional cookie-based challenge (Cloudflare-style).
-- **Auto-enable:** turn protection on/off by global RPS threshold.
+- **Real IP:** Cf-Connecting-Ip, X-Forwarded-For, or a custom header.
+- **Rate limits:** per-IP general limit; separate limits for sensitive paths (login, auth); per-host limit (ip:host); fingerprint limit (UA+Accept pattern); unique-URL throttle (scan/cache-bust); failed-auth limit with block.
+- **Block list:** blocked IPs get 444 + `Connection: close` (optionally no body so browsers retry less).
+- **Bypass and allowlist:** secret in header or cookie skips all checks; IP/CIDR allowlist skips all checks.
+- **Honeypot and trap:** hit a honeypot path (e.g. /wp-admin) → block IP; path contains substring (e.g. .env, .git) → block IP.
+- **Bot checks:** require User-Agent and/or Accept; block bad User-Agent list; max body size (reject if Content-Length > N).
+- **JS challenge:** session tokens stored server-side (not derivable), bind to IP; configurable TTL and store reset interval (e.g. 10m); polymorphic cookie name and challenge path per instance; optional response jitter.
+- **WAF:** path/query/header substring rules, block and add IP to block list.
+- **Auto-enable:** turn protection on/off when global RPS crosses a threshold.
 - **Caddyfile:** `cortex7 { ... }` and JSON in `handle` array.
 
 ---
