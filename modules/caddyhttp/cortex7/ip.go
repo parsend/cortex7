@@ -107,3 +107,52 @@ func isPrivateIP(s string) bool {
 	}
 	return ip.IsLoopback() || ip.IsLinkLocalUnicast()
 }
+
+// allowlistChecker precompiled IP/CIDR allowlist for fast lookup.
+type allowlistChecker struct {
+	prefixes []netip.Prefix
+	exact    map[string]struct{}
+}
+
+func buildAllowlist(allowlist []string) (*allowlistChecker, error) {
+	c := &allowlistChecker{exact: make(map[string]struct{}, len(allowlist))}
+	for _, s := range allowlist {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if strings.Contains(s, "/") {
+			p, err := netip.ParsePrefix(s)
+			if err != nil {
+				return nil, err
+			}
+			c.prefixes = append(c.prefixes, p)
+		} else {
+			a, err := netip.ParseAddr(s)
+			if err != nil {
+				return nil, err
+			}
+			c.exact[a.String()] = struct{}{}
+		}
+	}
+	return c, nil
+}
+
+func (c *allowlistChecker) contains(ipStr string) bool {
+	if c == nil || (len(c.prefixes) == 0 && len(c.exact) == 0) {
+		return false
+	}
+	if _, ok := c.exact[ipStr]; ok {
+		return true
+	}
+	a, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return false
+	}
+	for _, p := range c.prefixes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
+}

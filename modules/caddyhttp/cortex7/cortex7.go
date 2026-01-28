@@ -4,11 +4,12 @@ package cortex7
 
 import (
 	"context"
-	"crypto/rand"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/http"
 	"sort"
@@ -50,11 +51,50 @@ type Handler struct {
 	ChallengePath string `json:"challenge_path,omitempty"`
 	CookieName    string `json:"cookie_name,omitempty"`
 	CookieSecret  string `json:"cookie_secret,omitempty"`
+	// challenge token: server-side store, unique per session, not derivable
+	ChallengeTokenTTL           caddy.Duration `json:"challenge_token_ttl,omitempty"`
+	ChallengeStoreResetInterval caddy.Duration `json:"challenge_store_reset_interval,omitempty"`
+	// cookie options (configurable)
+	CookieSecure   bool   `json:"cookie_secure,omitempty"`
+	CookieSameSite string `json:"cookie_same_site,omitempty"` // Strict, Lax, None, ""
+	CookiePath     string `json:"cookie_path,omitempty"`
+	CookieDomain   string `json:"cookie_domain,omitempty"`
+	CookieMaxAge   int    `json:"cookie_max_age,omitempty"`
+	// polymorphism: random suffix per instance so scanners can't rely on fixed names
+	CookieRandomSuffix        bool `json:"cookie_random_suffix,omitempty"`
+	ChallengePathRandomSuffix bool `json:"challenge_path_random_suffix,omitempty"`
+	// response jitter (ms) to thwart timing/bot fingerprinting; 0 = disabled
+	ResponseJitterMin int `json:"response_jitter_min_ms,omitempty"`
+	ResponseJitterMax int `json:"response_jitter_max_ms,omitempty"`
 
 	BlockRefererList []string `json:"block_referer_list,omitempty"`
 	CloseNoBody      bool     `json:"close_no_body,omitempty"`
 
 	WAFRules []WAFRule `json:"waf_rules,omitempty"`
+
+	// bypass: header or cookie value equals secret -> skip all checks
+	BypassSecret       string `json:"bypass_secret,omitempty"`
+	BypassSecretHeader string `json:"bypass_secret_header,omitempty"` // header name, e.g. X-C7-Bypass
+	BypassSecretCookie string `json:"bypass_secret_cookie,omitempty"` // cookie name
+	// allowlist IP/CIDR: skip all checks
+	AllowlistIPs []string `json:"allowlist_ips,omitempty"`
+	// honeypot: hit path -> block IP
+	HoneypotPaths    []string        `json:"honeypot_paths,omitempty"`
+	HoneypotDuration caddy.Duration  `json:"honeypot_block_duration,omitempty"`
+	// trap: path contains substring -> block
+	TrapPaths []string `json:"trap_paths,omitempty"`
+	// bot: require UA, block bad UA list, optional require Accept
+	RequireUserAgent bool     `json:"require_user_agent,omitempty"`
+	BadUserAgents   []string `json:"bad_user_agents,omitempty"`
+	RequireAccept   bool     `json:"require_accept_header,omitempty"`
+	// max body: reject if Content-Length > N (413 or 444)
+	MaxBodyBytes int64 `json:"max_body_bytes,omitempty"`
+	// per-host rate: key = ip:host
+	PerHostLimit int64 `json:"per_host_limit,omitempty"`
+	// fingerprint rate: key = hash(UA+Accept) per ip
+	FingerprintLimit int64 `json:"fingerprint_limit,omitempty"`
+	// unique URL throttle: scan/cache-bust
+	MaxUniqueURLsPerMinute int64 `json:"max_unique_urls_per_minute,omitempty"`
 
 	store *store
 	logger *zap.Logger
@@ -78,6 +118,12 @@ type Handler struct {
 	wafRuleIdxHeader []int
 	generalPrefixLen int
 	challengePathLen int
+
+	allowlist     *allowlistChecker
+	honeypotExact  map[string]struct{}
+	honeypotPrefix []string
+	trapBytes      [][]byte
+	badUABytes     [][]byte
 }
 
 // WAFRule is a single WAF rule.
@@ -126,19 +172,77 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.ChallengePath == "" {
 		h.ChallengePath = "/.c7c"
 	}
+	if h.ChallengeTokenTTL == 0 {
+		h.ChallengeTokenTTL = caddy.Duration(time.Hour)
+	}
+	if h.ChallengeStoreResetInterval == 0 {
+		h.ChallengeStoreResetInterval = caddy.Duration(10 * time.Minute)
+	}
+	if h.CookieMaxAge == 0 {
+		h.CookieMaxAge = 3600
+	}
+	// polymorphism lol
+	if h.CookieRandomSuffix {
+		suf := make([]byte, 4)
+		crand.Read(suf)
+		h.CookieName = h.CookieName + "_" + hex.EncodeToString(suf)
+	}
+	if h.ChallengePathRandomSuffix {
+		suf := make([]byte, 4)
+		crand.Read(suf)
+		h.ChallengePath = h.ChallengePath + "_" + hex.EncodeToString(suf)
+	}
 	h.challengePathLen = len(h.ChallengePath)
+	if h.CookiePath == "" {
+		h.CookiePath = "/"
+	}
+	if h.HoneypotDuration == 0 {
+		h.HoneypotDuration = h.BlockDuration
+	}
+	// allowlist IP/CIDR
+	if len(h.AllowlistIPs) > 0 {
+		var err error
+		h.allowlist, err = buildAllowlist(h.AllowlistIPs)
+		if err != nil {
+			return err
+		}
+	}
+	// honeypot: exact + prefix
+	h.honeypotExact = make(map[string]struct{}, len(h.HoneypotPaths))
+	for _, p := range h.HoneypotPaths {
+		if p == "" {
+			continue
+		}
+		if strings.HasSuffix(p, "/") || strings.Contains(p[1:], "/") {
+			h.honeypotPrefix = append(h.honeypotPrefix, p)
+		} else {
+			h.honeypotExact[p] = struct{}{}
+		}
+	}
+	sort.Slice(h.honeypotPrefix, func(i, j int) bool { return len(h.honeypotPrefix[i]) > len(h.honeypotPrefix[j]) })
+	// trap paths as byte slices
+	for _, s := range h.TrapPaths {
+		if s != "" {
+			h.trapBytes = append(h.trapBytes, []byte(s))
+		}
+	}
+	for _, s := range h.BadUserAgents {
+		if s != "" {
+			h.badUABytes = append(h.badUABytes, []byte(s))
+		}
+	}
 	if h.CookieName == "" {
 		h.CookieName = "_c7v"
 	}
 	if h.CookieSecret == "" {
 		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
+		if _, err := crand.Read(b); err != nil {
 			return err
 		}
 		h.CookieSecret = hex.EncodeToString(b)
 	}
 	h.challengeNonce = make([]byte, 16)
-	if _, err := rand.Read(h.challengeNonce); err != nil {
+	if _, err := crand.Read(h.challengeNonce); err != nil {
 		return err
 	}
 	h.generalPrefixLen = len(h.GeneralPrefix)
@@ -207,6 +311,18 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			h.store.prune()
 		}
 	}()
+	// challenge token store reset (configurable, default 10m): all cookies invalid, re-challenge
+	go func() {
+		iv := time.Duration(h.ChallengeStoreResetInterval)
+		if iv < time.Minute {
+			iv = time.Minute
+		}
+		t := time.NewTicker(iv)
+		defer t.Stop()
+		for range t.C {
+			h.store.resetChallengeTokens()
+		}
+	}()
 	return nil
 }
 
@@ -214,6 +330,15 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 func (h *Handler) Validate() error {
 	if h.SensitiveLimit < 1 || h.GeneralLimit < 1 {
 		return fmt.Errorf("sensitive_limit and general_limit must be >= 1")
+	}
+	if h.JSChallenge && h.ChallengeTokenTTL < caddy.Duration(time.Second) {
+		return fmt.Errorf("challenge_token_ttl must be >= 1s when js_challenge enabled")
+	}
+	if h.JSChallenge && h.ChallengeStoreResetInterval > 0 && h.ChallengeStoreResetInterval < caddy.Duration(time.Minute) {
+		return fmt.Errorf("challenge_store_reset_interval must be >= 1m or 0 to disable")
+	}
+	if h.ResponseJitterMax > 0 && h.ResponseJitterMax < h.ResponseJitterMin {
+		return fmt.Errorf("response_jitter_max_ms must be >= response_jitter_min_ms")
 	}
 	return nil
 }
@@ -227,6 +352,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 	path := r.URL.Path
 	pathLen := len(path)
+
+	// bypass: secret in header or cookie
+	if h.BypassSecret != "" {
+		if h.BypassSecretHeader != "" && r.Header.Get(h.BypassSecretHeader) == h.BypassSecret {
+			return next.ServeHTTP(w, r)
+		}
+		if h.BypassSecretCookie != "" {
+			if c, _ := r.Cookie(h.BypassSecretCookie); c != nil && c.Value == h.BypassSecret {
+				return next.ServeHTTP(w, r)
+			}
+		}
+	}
 
 	// tick global counter, get current minute bucket (one time.Now() for both)
 	now := time.Now()
@@ -269,7 +406,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return next.ServeHTTP(w, r)
 	}
 
+	// allowlist IP/CIDR: skip all checks
+	if h.allowlist != nil && h.allowlist.contains(ip) {
+		return next.ServeHTTP(w, r)
+	}
+
 	if ok, _ := h.store.isBlocked(ip); ok {
+		h.reject(w, r)
+		return nil
+	}
+
+	// trap paths: path contains substring -> block IP
+	for _, b := range h.trapBytes {
+		if indexBytes(*(*[]byte)(unsafe.Pointer(&path)), b) >= 0 {
+			h.store.block(ip, "trap_path", time.Duration(h.HoneypotDuration))
+			h.reject(w, r)
+			return nil
+		}
+	}
+
+	// max body
+	if h.MaxBodyBytes > 0 && r.ContentLength > h.MaxBodyBytes {
 		h.reject(w, r)
 		return nil
 	}
@@ -305,6 +462,39 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	for i, b := range h.wafHeaderBytes {
 		if wafHeaderContains(r, b) {
 			h.store.block(ip, "waf:"+h.WAFRules[h.wafRuleIdxHeader[i]].ID, time.Duration(h.BlockDuration))
+			h.reject(w, r)
+			return nil
+		}
+	}
+
+	// bot checks: require UA, block bad UA, require Accept
+	if h.RequireUserAgent && r.UserAgent() == "" {
+		h.reject(w, r)
+		return nil
+	}
+	ua := r.UserAgent()
+	uaB := *(*[]byte)(unsafe.Pointer(&ua))
+	for _, b := range h.badUABytes {
+		if indexBytes(uaB, b) >= 0 {
+			h.store.block(ip, "bad_user_agent", time.Duration(h.BlockDuration))
+			h.reject(w, r)
+			return nil
+		}
+	}
+	if h.RequireAccept && r.Header.Get("Accept") == "" {
+		h.reject(w, r)
+		return nil
+	}
+
+	// honeypot: hit path -> block IP
+	if _, ok := h.honeypotExact[path]; ok {
+		h.store.block(ip, "honeypot", time.Duration(h.HoneypotDuration))
+		h.reject(w, r)
+		return nil
+	}
+	for _, p := range h.honeypotPrefix {
+		if pathLen >= len(p) && path[:len(p)] == p {
+			h.store.block(ip, "honeypot", time.Duration(h.HoneypotDuration))
 			h.reject(w, r)
 			return nil
 		}
@@ -346,6 +536,43 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				}
 				break
 			}
+		}
+	}
+
+	// per-host rate limit
+	if h.PerHostLimit > 0 {
+		hostKey := ip + ":" + r.Host
+		n := h.store.incReqKey(hostKey, bucketMin)
+		if n > h.PerHostLimit {
+			h.store.block(ip, "rate_limit_per_host", time.Duration(h.BlockDuration))
+			h.reject(w, r)
+			return nil
+		}
+	}
+
+	// fingerprint rate limit (same UA+Accept pattern per IP)
+	if h.FingerprintLimit > 0 {
+		accept := r.Header.Get("Accept")
+		fpKey := ip + ":" + fmt.Sprintf("%016x", hashPathQuery(ua+accept))
+		n := h.store.incReqKey(fpKey, bucketMin)
+		if n > h.FingerprintLimit {
+			h.store.block(ip, "rate_limit_fingerprint", time.Duration(h.BlockDuration))
+			h.reject(w, r)
+			return nil
+		}
+	}
+
+	// unique URL throttle (scan/cache-bust)
+	if h.MaxUniqueURLsPerMinute > 0 {
+		pathQuery := path
+		if r.URL.RawQuery != "" {
+			pathQuery = path + "?" + r.URL.RawQuery
+		}
+		n := h.store.addUniqueURL(ip, pathQuery, bucketMin)
+		if n > h.MaxUniqueURLsPerMinute {
+			h.store.block(ip, "rate_limit_unique_url", time.Duration(h.BlockDuration))
+			h.reject(w, r)
+			return nil
 		}
 	}
 
@@ -397,52 +624,93 @@ func (h *Handler) realIP(r *http.Request) string {
 }
 
 func (h *Handler) reject(w http.ResponseWriter, r *http.Request) {
+	h.responseJitter()
 	r.Close = true
 	w.Header().Set("Connection", "close")
 	w.WriteHeader(444)
 }
 
+// responseJitter adds random delay to thwart timing/bot fingerprinting
+func (h *Handler) responseJitter() {
+	min, max := h.ResponseJitterMin, h.ResponseJitterMax
+	if min <= 0 || max < min {
+		return
+	}
+	ms := min
+	if max > min {
+		ms = min + rand.Intn(max-min+1)
+	}
+	if ms > 0 {
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+	}
+}
+
 func (h *Handler) serveChallenge(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
-	token := r.URL.Query().Get("t")
+	urlToken := r.URL.Query().Get("t")
 	ip := h.realIP(r)
 	if ip == "" {
 		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
 	}
 	ip = trimIPv4Mapping(ip)
-	if token == "" {
+	if urlToken == "" {
 		return h.serveChallengePage(w, r)
 	}
-	expected := h.challengeToken(ip)
-	if subtleCompare(token, expected) {
-		cookie := &http.Cookie{
-			Name:     h.CookieName,
-			Value:    expected,
-			Path:     "/",
-			MaxAge:   3600,
-			HttpOnly: true,
-			Secure:   r.TLS != nil,
-			SameSite: http.SameSiteLaxMode,
-		}
-		http.SetCookie(w, cookie)
-		w.Header().Set("Location", "/")
-		w.WriteHeader(http.StatusFound)
+	// URL token derived from IP+nonce+secret so only real browser from this IP gets valid link
+	expectedURL := h.challengeToken(ip)
+	if !subtleCompare(urlToken, expectedURL) {
+		h.reject(w, r)
 		return nil
 	}
-	h.reject(w, r)
+	// issue unique session token (not derivable), store server-side, bind to IP
+	raw := make([]byte, 32)
+	if _, err := crand.Read(raw); err != nil {
+		h.reject(w, r)
+		return nil
+	}
+	sessionToken := hex.EncodeToString(raw)
+	until := time.Now().Add(time.Duration(h.ChallengeTokenTTL)).UnixNano()
+	h.store.setChallengeToken(sessionToken, ip, until)
+	cookie := h.buildChallengeCookie(sessionToken, r)
+	http.SetCookie(w, cookie)
+	w.Header().Set("Location", "/")
+	w.WriteHeader(http.StatusFound)
 	return nil
 }
 
+// challengeToken derives URL param token (IP+nonce+secret) so only real browser gets valid link
 func (h *Handler) challengeToken(ip string) string {
 	s := fmt.Sprintf("%s:%x:%s", ip, h.challengeNonce, h.CookieSecret)
 	sum := sha256.Sum256([]byte(s))
 	return base64.URLEncoding.EncodeToString(sum[:])[:32]
 }
 
+// verifyChallengeCookie checks cookie against server-side store: token exists, IP match, not expired
 func (h *Handler) verifyChallengeCookie(c *http.Cookie, ip string) bool {
-	if c == nil {
+	if c == nil || c.Value == "" {
 		return false
 	}
-	return subtleCompare(c.Value, h.challengeToken(ip))
+	return h.store.validateChallengeToken(c.Value, ip, time.Now().UnixNano())
+}
+
+func (h *Handler) buildChallengeCookie(value string, r *http.Request) *http.Cookie {
+	secure := h.CookieSecure || r.TLS != nil
+	sameSite := http.SameSiteLaxMode
+	switch strings.ToLower(h.CookieSameSite) {
+	case "strict":
+		sameSite = http.SameSiteStrictMode
+	case "none":
+		sameSite = http.SameSiteNoneMode
+	}
+	return &http.Cookie{
+		Name:     h.CookieName,
+		Value:    value,
+		Path:     h.CookiePath,
+		Domain:   h.CookieDomain,
+		MaxAge:   h.CookieMaxAge,
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: sameSite,
+	}
 }
 
 func subtleCompare(a, b string) bool {
@@ -457,6 +725,7 @@ func subtleCompare(a, b string) bool {
 }
 
 func (h *Handler) serveChallengePage(w http.ResponseWriter, r *http.Request) error {
+	h.responseJitter()
 	ip := h.realIP(r)
 	if ip == "" {
 		ip, _, _ = net.SplitHostPort(r.RemoteAddr)

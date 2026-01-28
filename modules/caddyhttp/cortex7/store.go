@@ -23,20 +23,37 @@ type windowCount struct {
 	until int64
 }
 
+type uniqueURLWindow struct {
+	until int64
+	urls  map[uint64]struct{}
+}
+
+// challengeEntry binds issued token to IP and expiry (server-side, not derivable)
+type challengeEntry struct {
+	ip   string
+	until int64
+}
+
 type shard struct {
-	mu         sync.RWMutex
-	blocked    map[string]blockEntry
-	reqCount   map[string]*windowCount
-	reqByPath  map[string]map[string]*windowCount
-	failedAuth map[string]*windowCount
+	mu          sync.RWMutex
+	blocked      map[string]blockEntry
+	reqCount     map[string]*windowCount
+	reqByPath    map[string]map[string]*windowCount
+	reqByKey     map[string]*windowCount   // per-host, fingerprint
+	failedAuth   map[string]*windowCount
+	uniqueURLs   map[string]*uniqueURLWindow // ip -> window of pathQuery hashes
+	challengeTokens map[string]challengeEntry // token -> ip, until (vector DB ours)
 }
 
 func newShard() *shard {
 	return &shard{
-		blocked:    make(map[string]blockEntry, 64),
-		reqCount:   make(map[string]*windowCount, 256),
-		reqByPath:  make(map[string]map[string]*windowCount, 64),
-		failedAuth: make(map[string]*windowCount, 64),
+		blocked:         make(map[string]blockEntry, 64),
+		reqCount:        make(map[string]*windowCount, 256),
+		reqByPath:       make(map[string]map[string]*windowCount, 64),
+		reqByKey:        make(map[string]*windowCount, 128),
+		failedAuth:      make(map[string]*windowCount, 64),
+		uniqueURLs:      make(map[string]*uniqueURLWindow, 64),
+		challengeTokens: make(map[string]challengeEntry, 128),
 	}
 }
 
@@ -63,6 +80,18 @@ func hashIP(ip string) uint32 {
 
 func (s *store) shard(ip string) *shard {
 	return s.shards[hashIP(ip)]
+}
+
+func hashKey(key string) uint32 {
+	var h uint32
+	for i := 0; i < len(key); i++ {
+		h = h*31 + uint32(key[i])
+	}
+	return h % shardCount
+}
+
+func (s *store) shardByKey(key string) *shard {
+	return s.shards[hashKey(key)]
 }
 
 func (s *store) isBlocked(ip string) (bool, string) {
@@ -141,6 +170,96 @@ func (s *store) incFailedAuth(ip string, bucketAuth int64) int64 {
 	return n
 }
 
+func (s *store) incReqKey(key string, bucketMin int64) int64 {
+	sh := s.shardByKey(key)
+	sh.mu.Lock()
+	w, ok := sh.reqByKey[key]
+	if !ok || w.until != bucketMin {
+		w = &windowCount{count: 1, until: bucketMin}
+		sh.reqByKey[key] = w
+		sh.mu.Unlock()
+		return 1
+	}
+	w.count++
+	n := w.count
+	sh.mu.Unlock()
+	return n
+}
+
+func hashPathQuery(s string) uint64 {
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= 1099511628211
+	}
+	return h
+}
+
+// setChallengeToken stores token bound to IP and expiry (one token per session, not derivable)
+func (s *store) setChallengeToken(token, ip string, until int64) {
+	sh := s.shardByKey(token)
+	sh.mu.Lock()
+	sh.challengeTokens[token] = challengeEntry{ip: ip, until: until}
+	sh.mu.Unlock()
+}
+
+// validateChallengeToken checks token exists, IP matches, not expired. constant-time path.
+func (s *store) validateChallengeToken(token, ip string, nowNano int64) bool {
+	if token == "" || ip == "" {
+		return false
+	}
+	sh := s.shardByKey(token)
+	sh.mu.RLock()
+	e, ok := sh.challengeTokens[token]
+	sh.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if nowNano >= e.until {
+		sh.mu.Lock()
+		delete(sh.challengeTokens, token)
+		sh.mu.Unlock()
+		return false
+	}
+	return constantTimeEqual(e.ip, ip)
+}
+
+func constantTimeEqual(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff uint8
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
+}
+
+func (s *store) resetChallengeTokens() {
+	for i := 0; i < shardCount; i++ {
+		sh := s.shards[i]
+		sh.mu.Lock()
+		for k := range sh.challengeTokens {
+			delete(sh.challengeTokens, k)
+		}
+		sh.mu.Unlock()
+	}
+}
+
+func (s *store) addUniqueURL(ip, pathQuery string, bucketMin int64) int64 {
+	sh := s.shard(ip)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	w, ok := sh.uniqueURLs[ip]
+	if !ok || w.until != bucketMin {
+		w = &uniqueURLWindow{until: bucketMin, urls: make(map[uint64]struct{}, 32)}
+		sh.uniqueURLs[ip] = w
+	}
+	h := hashPathQuery(pathQuery)
+	w.urls[h] = struct{}{}
+	return int64(len(w.urls))
+}
+
 func (s *store) prune() {
 	now := time.Now()
 	bucketMin := now.Truncate(windowMinute).Unix()
@@ -172,6 +291,21 @@ func (s *store) prune() {
 		for ip, w := range sh.failedAuth {
 			if w.until != bucketAuth {
 				delete(sh.failedAuth, ip)
+			}
+		}
+		for key, w := range sh.reqByKey {
+			if w.until != bucketMin {
+				delete(sh.reqByKey, key)
+			}
+		}
+		for ip, w := range sh.uniqueURLs {
+			if w.until != bucketMin {
+				delete(sh.uniqueURLs, ip)
+			}
+		}
+		for token, e := range sh.challengeTokens {
+			if nowNano >= e.until {
+				delete(sh.challengeTokens, token)
 			}
 		}
 		sh.mu.Unlock()

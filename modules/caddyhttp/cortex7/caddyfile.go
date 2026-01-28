@@ -92,6 +92,46 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 			if h.NextArg() {
 				handler.CookieName = h.Val()
 			}
+		case "challenge_token_ttl":
+			if h.NextArg() {
+				d, _ := parseDuration(h.Val())
+				handler.ChallengeTokenTTL = caddy.Duration(d)
+			}
+		case "challenge_store_reset_interval":
+			if h.NextArg() {
+				d, _ := parseDuration(h.Val())
+				handler.ChallengeStoreResetInterval = caddy.Duration(d)
+			}
+		case "cookie_secure":
+			handler.CookieSecure = true
+		case "cookie_same_site":
+			if h.NextArg() {
+				handler.CookieSameSite = h.Val()
+			}
+		case "cookie_path":
+			if h.NextArg() {
+				handler.CookiePath = h.Val()
+			}
+		case "cookie_domain":
+			if h.NextArg() {
+				handler.CookieDomain = h.Val()
+			}
+		case "cookie_max_age":
+			if h.NextArg() {
+				handler.CookieMaxAge, _ = strconv.Atoi(h.Val())
+			}
+		case "cookie_random_suffix":
+			handler.CookieRandomSuffix = true
+		case "challenge_path_random_suffix":
+			handler.ChallengePathRandomSuffix = true
+		case "response_jitter_min_ms":
+			if h.NextArg() {
+				handler.ResponseJitterMin, _ = strconv.Atoi(h.Val())
+			}
+		case "response_jitter_max_ms":
+			if h.NextArg() {
+				handler.ResponseJitterMax, _ = strconv.Atoi(h.Val())
+			}
 		case "close_no_body":
 			handler.CloseNoBody = true
 		case "block_referer":
@@ -110,6 +150,59 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 					match = h.Val()
 				}
 				handler.WAFRules = append(handler.WAFRules, WAFRule{ID: id, Type: typ, Match: match, Action: "block"})
+			}
+		case "bypass_secret":
+			if h.NextArg() {
+				handler.BypassSecret = h.Val()
+			}
+		case "bypass_secret_header":
+			if h.NextArg() {
+				handler.BypassSecretHeader = h.Val()
+			}
+		case "bypass_secret_cookie":
+			if h.NextArg() {
+				handler.BypassSecretCookie = h.Val()
+			}
+		case "allowlist_ips":
+			for h.NextArg() {
+				handler.AllowlistIPs = append(handler.AllowlistIPs, h.Val())
+			}
+		case "honeypot_paths":
+			for h.NextArg() {
+				handler.HoneypotPaths = append(handler.HoneypotPaths, h.Val())
+			}
+		case "honeypot_block_duration":
+			if h.NextArg() {
+				d, _ := parseDuration(h.Val())
+				handler.HoneypotDuration = caddy.Duration(d)
+			}
+		case "trap_paths":
+			for h.NextArg() {
+				handler.TrapPaths = append(handler.TrapPaths, h.Val())
+			}
+		case "require_user_agent":
+			handler.RequireUserAgent = true
+		case "bad_user_agents":
+			for h.NextArg() {
+				handler.BadUserAgents = append(handler.BadUserAgents, h.Val())
+			}
+		case "require_accept":
+			handler.RequireAccept = true
+		case "max_body_bytes":
+			if h.NextArg() {
+				handler.MaxBodyBytes, _ = strconv.ParseInt(h.Val(), 10, 64)
+			}
+		case "per_host_limit":
+			if h.NextArg() {
+				handler.PerHostLimit, _ = strconv.ParseInt(h.Val(), 10, 64)
+			}
+		case "fingerprint_limit":
+			if h.NextArg() {
+				handler.FingerprintLimit, _ = strconv.ParseInt(h.Val(), 10, 64)
+			}
+		case "max_unique_urls_per_minute":
+			if h.NextArg() {
+				handler.MaxUniqueURLsPerMinute, _ = strconv.ParseInt(h.Val(), 10, 64)
 			}
 		}
 	}
