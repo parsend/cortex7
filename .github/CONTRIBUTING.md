@@ -1,5 +1,12 @@
-Contributing to Caddy
-=====================
+Contributing to Cortex7
+========================
+
+Cortex7 is a fork of [Caddy](https://github.com/caddyserver/caddy). Pull requests and issues for this fork go to [github.com/parsend/cortex7](https://github.com/parsend/cortex7). For cortex7-specific code (e.g. `modules/caddyhttp/cortex7`), we follow the guidelines below; for upstream Caddy contributions, see the [Caddy repo](https://github.com/caddyserver/caddy).
+
+---
+
+Contributing to Caddy (upstream)
+=================================
 
 Welcome! Thank you for choosing to be a part of our community. Caddy wouldn't be nearly as excellent without your involvement!
 

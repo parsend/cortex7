@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Cortex7 / Caddy issues
+    url: https://github.com/parsend/cortex7/issues
+    about: Bug reports and feature requests for cortex7 (this repo)
   - name: Caddy forum
     url: https://caddy.community
-    about: If you have questions (or answers!) about using Caddy, please use our forum
+    about: Questions about using Caddy in general

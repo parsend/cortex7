@@ -46,6 +46,7 @@ import (
 // writes a response and terminates the middleware chain.
 var defaultDirectiveOrder = []string{
 	"tracing",
+	"cortex7",
 
 	// set variables that may be used by other directives
 	"map",

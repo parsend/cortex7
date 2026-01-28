@@ -1,6 +1,8 @@
 # Security Policy
 
-The Caddy project would like to make sure that it stays on top of all practically-exploitable vulnerabilities.
+Cortex7 is a fork of Caddy with added cortex7 middleware. For **cortex7-specific** code (modules/caddyhttp/cortex7), report vulnerabilities via this repository's [Security tab](https://github.com/parsend/cortex7/security/advisories/new). For upstream Caddy code, see [Caddy security policy](https://github.com/caddyserver/caddy/security/policy).
+
+The project aims to address practically-exploitable vulnerabilities in this codebase.
 
 
 ## Supported Versions
