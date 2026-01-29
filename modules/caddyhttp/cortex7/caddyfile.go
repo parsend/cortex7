@@ -160,6 +160,8 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 			handler.CookieRandomSuffix = true
 		case "challenge_path_random_suffix":
 			handler.ChallengePathRandomSuffix = true
+		case "no_cookie_reject":
+			handler.NoCookieReject = true
 		case "response_jitter_min_ms":
 			if h.NextArg() {
 				handler.ResponseJitterMin, _ = strconv.Atoi(h.Val())

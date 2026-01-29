@@ -68,6 +68,8 @@ type Handler struct {
 	// polymorphism: random suffix per instance so scanners can't rely on fixed names
 	CookieRandomSuffix        bool `json:"cookie_random_suffix,omitempty"`
 	ChallengePathRandomSuffix bool `json:"challenge_path_random_suffix,omitempty"`
+	// no_cookie_reject: when js_challenge on and no valid cookie, 444 instead of challenge page (strict drop)
+	NoCookieReject bool `json:"no_cookie_reject,omitempty"`
 	// response jitter (ms) to thwart timing/bot fingerprinting; 0 = disabled
 	ResponseJitterMin int `json:"response_jitter_min_ms,omitempty"`
 	ResponseJitterMax int `json:"response_jitter_max_ms,omitempty"`
@@ -533,6 +535,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				if h.verifyChallengeCookie(cookie, ip) {
 					continue
 				}
+				if h.NoCookieReject {
+					h.rejectWithReason(w, r, "waf_challenge_no_cookie")
+					return nil
+				}
 				return h.serveChallengePage(w, r)
 			}
 			h.store.block(ip, "waf:"+rule.ID, time.Duration(h.BlockDuration))
@@ -550,6 +556,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				if h.verifyChallengeCookie(cookie, ip) {
 					continue
 				}
+				if h.NoCookieReject {
+					h.rejectWithReason(w, r, "waf_challenge_no_cookie")
+					return nil
+				}
 				return h.serveChallengePage(w, r)
 			}
 			h.store.block(ip, "waf:"+rule.ID, time.Duration(h.BlockDuration))
@@ -564,6 +574,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				cookie, _ := r.Cookie(h.CookieName)
 				if h.verifyChallengeCookie(cookie, ip) {
 					continue
+				}
+				if h.NoCookieReject {
+					h.rejectWithReason(w, r, "waf_challenge_no_cookie")
+					return nil
 				}
 				return h.serveChallengePage(w, r)
 			}
@@ -620,6 +634,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		cookie, _ := r.Cookie(h.CookieName)
 		if !h.verifyChallengeCookie(cookie, ip) {
+			if h.NoCookieReject {
+				h.rejectWithReason(w, r, "no_challenge_cookie")
+				return nil
+			}
 			return h.serveChallengePage(w, r)
 		}
 	}
