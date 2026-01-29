@@ -36,20 +36,22 @@ type challengeEntry struct {
 }
 
 type shard struct {
-	mu          sync.RWMutex
-	blocked      map[string]blockEntry
-	reqCount     map[string]*windowCount
-	reqByPath    map[string]map[string]*windowCount
-	reqByKey     map[string]*windowCount   // per-host, fingerprint
-	failedAuth   map[string]*windowCount
-	uniqueURLs   map[string]*uniqueURLWindow // ip -> window of pathQuery hashes
-	challengeTokens map[string]challengeEntry // token -> ip, until (vector DB ours)
+	mu               sync.RWMutex
+	blocked          map[string]blockEntry
+	reqCount         map[string]*windowCount
+	reqBurst         map[string]*windowCount   // ip -> count in short window (anti-flood)
+	reqByPath        map[string]map[string]*windowCount
+	reqByKey         map[string]*windowCount   // per-host, fingerprint
+	failedAuth       map[string]*windowCount
+	uniqueURLs       map[string]*uniqueURLWindow
+	challengeTokens  map[string]challengeEntry
 }
 
 func newShard() *shard {
 	return &shard{
 		blocked:         make(map[string]blockEntry, 64),
 		reqCount:        make(map[string]*windowCount, 256),
+		reqBurst:        make(map[string]*windowCount, 256),
 		reqByPath:       make(map[string]map[string]*windowCount, 64),
 		reqByKey:        make(map[string]*windowCount, 128),
 		failedAuth:      make(map[string]*windowCount, 64),
@@ -119,6 +121,22 @@ func (s *store) block(ip, reason string, duration time.Duration) {
 	sh.mu.Lock()
 	sh.blocked[ip] = blockEntry{until: until, reason: reason}
 	sh.mu.Unlock()
+}
+
+func (s *store) incReqBurst(ip string, bucketBurst int64) int64 {
+	sh := s.shard(ip)
+	sh.mu.Lock()
+	w, ok := sh.reqBurst[ip]
+	if !ok || w.until != bucketBurst {
+		w = &windowCount{count: 1, until: bucketBurst}
+		sh.reqBurst[ip] = w
+		sh.mu.Unlock()
+		return 1
+	}
+	w.count++
+	n := w.count
+	sh.mu.Unlock()
+	return n
 }
 
 func (s *store) incReq(ip string, bucketMin int64) int64 {
@@ -278,12 +296,16 @@ func (s *store) addUniqueURL(ip, pathQuery string, bucketMin int64) int64 {
 	return int64(len(w.urls))
 }
 
-func (s *store) prune(rateLimitWindow time.Duration) {
+func (s *store) prune(rateLimitWindow, burstWindow time.Duration) {
 	now := time.Now()
 	if rateLimitWindow < time.Second {
 		rateLimitWindow = windowMinute
 	}
+	if burstWindow < time.Second {
+		burstWindow = 10 * time.Second
+	}
 	bucketMin := now.Truncate(rateLimitWindow).Unix()
+	bucketBurst := now.Truncate(burstWindow).Unix()
 	bucketAuth := now.Truncate(windowAuth).Unix()
 	nowNano := now.UnixNano()
 	for i := 0; i < shardCount; i++ {
@@ -292,6 +314,11 @@ func (s *store) prune(rateLimitWindow time.Duration) {
 		for ip, e := range sh.blocked {
 			if nowNano >= e.until {
 				delete(sh.blocked, ip)
+			}
+		}
+		for ip, w := range sh.reqBurst {
+			if w.until != bucketBurst {
+				delete(sh.reqBurst, ip)
 			}
 		}
 		for ip, w := range sh.reqCount {
