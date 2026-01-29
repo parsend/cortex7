@@ -374,11 +374,12 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if pruneWindow < time.Second {
 		pruneWindow = time.Minute
 	}
+	burstWindow := 10 * time.Second
 	go func() {
 		t := time.NewTicker(2 * time.Minute)
 		defer t.Stop()
 		for range t.C {
-			h.store.prune(pruneWindow)
+			h.store.prune(pruneWindow, burstWindow)
 		}
 	}()
 	// challenge token store reset (configurable, default 10m): all cookies invalid, re-challenge
