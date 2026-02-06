@@ -1,11 +1,8 @@
-// cortex7 L7 DDoS/WAF middleware, hyper-optimized for millions RPS. parsend(c0redev). github.com/parsend/cortex7
-
 package cortex7
 
 import (
 	"context"
 	crand "crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -28,7 +25,6 @@ func init() {
 	caddy.RegisterModule(Handler{})
 }
 
-// Handler implements DDoS/WAF protection with in-memory store, JS challenge, cookies.
 type Handler struct {
 	Enabled               bool   `json:"enabled,omitempty"`
 	AutoEnable            bool   `json:"auto_enable,omitempty"`
@@ -40,78 +36,63 @@ type Handler struct {
 	SensitiveLimit   int64            `json:"sensitive_limit,omitempty"`
 	SensitiveLimits  map[string]int64 `json:"sensitive_limits,omitempty"`
 	GeneralPrefix    string           `json:"general_prefix,omitempty"`
-	GeneralLimit     *int64           `json:"general_limit,omitempty"` // nil = default 120, 0 = disable
-	RateLimitWindow  caddy.Duration   `json:"rate_limit_window,omitempty"` // bucket window for general/sensitive/per-host/fingerprint/uniqueURL; default 1m
+	GeneralLimit     *int64           `json:"general_limit,omitempty"`
+	RateLimitWindow  caddy.Duration   `json:"rate_limit_window,omitempty"`
 	FailedAuthLimit  int64            `json:"failed_auth_limit,omitempty"`
 	BlockDuration    caddy.Duration   `json:"block_duration,omitempty"`
 	BlockDurationAuth caddy.Duration  `json:"block_duration_failed_auth,omitempty"`
 
 	RealIPHeaderCF     string `json:"real_ip_cf_header,omitempty"`
 	RealIPHeaderCustom string `json:"real_ip_custom_header,omitempty"`
-	RealIPXFFMode      string `json:"real_ip_xff_mode,omitempty"` // "first" (default) or "last"
+	RealIPXFFMode      string `json:"real_ip_xff_mode,omitempty"`
 
 	JSChallenge   bool   `json:"js_challenge,omitempty"`
 	ChallengePath string `json:"challenge_path,omitempty"`
 	CookieName    string `json:"cookie_name,omitempty"`
 	CookieSecret  string `json:"cookie_secret,omitempty"`
-	// challenge token: server-side store, unique per session, not derivable
 	ChallengeTokenTTL           caddy.Duration `json:"challenge_token_ttl,omitempty"`
 	ChallengeStoreResetInterval caddy.Duration `json:"challenge_store_reset_interval,omitempty"`
-	ChallengePathLimit          int64         `json:"challenge_path_limit,omitempty"`   // requests/min per IP to challenge path; 0 = no limit
-	ChallengeStoreMaxSize       int64         `json:"challenge_store_max_size,omitempty"` // max tokens in store; 0 = no limit
-	// cookie options (configurable)
+	ChallengePathLimit          int64         `json:"challenge_path_limit,omitempty"`
+	ChallengeStoreMaxSize       int64         `json:"challenge_store_max_size,omitempty"`
 	CookieSecure   bool   `json:"cookie_secure,omitempty"`
-	CookieSameSite string `json:"cookie_same_site,omitempty"` // Strict, Lax, None, ""
+	CookieSameSite string `json:"cookie_same_site,omitempty"`
 	CookiePath     string `json:"cookie_path,omitempty"`
 	CookieDomain   string `json:"cookie_domain,omitempty"`
 	CookieMaxAge   int    `json:"cookie_max_age,omitempty"`
-	// polymorphism: random suffix per instance so scanners can't rely on fixed names
 	CookieRandomSuffix        bool `json:"cookie_random_suffix,omitempty"`
 	ChallengePathRandomSuffix bool `json:"challenge_path_random_suffix,omitempty"`
-	// no_cookie_reject: when js_challenge on and no valid cookie, 444 instead of challenge page (strict drop)
 	NoCookieReject bool `json:"no_cookie_reject,omitempty"`
-	// response jitter (ms) to thwart timing/bot fingerprinting; 0 = disabled
 	ResponseJitterMin int `json:"response_jitter_min_ms,omitempty"`
 	ResponseJitterMax int `json:"response_jitter_max_ms,omitempty"`
 
 	BlockRefererList []string `json:"block_referer_list,omitempty"`
 	CloseNoBody      bool     `json:"close_no_body,omitempty"`
-	// reject response: status code (default 444); max_body uses max_body_reject_code (default 413)
 	RejectStatusCode   int `json:"reject_status_code,omitempty"`
 	MaxBodyRejectCode  int `json:"max_body_reject_code,omitempty"`
-	// custom reject: redirect (priority) or HTML body
 	RejectRedirectURL string `json:"reject_redirect_url,omitempty"`
-	RejectBody       string `json:"reject_body,omitempty"` // inline HTML or path to file
-	LogBlocks        bool   `json:"log_blocks,omitempty"`   // log reason, IP, path, method on block
+	RejectBody       string `json:"reject_body,omitempty"`
+	LogBlocks        bool   `json:"log_blocks,omitempty"`
 
 	WAFRules []WAFRule `json:"waf_rules,omitempty"`
 
-	// bypass: header or cookie value equals secret -> skip all checks
 	BypassSecret       string `json:"bypass_secret,omitempty"`
-	BypassSecretHeader string `json:"bypass_secret_header,omitempty"` // header name, e.g. X-C7-Bypass
-	BypassSecretCookie string `json:"bypass_secret_cookie,omitempty"` // cookie name
-	// allowlist IP/CIDR: skip all checks
+	BypassSecretHeader string `json:"bypass_secret_header,omitempty"`
+	BypassSecretCookie string `json:"bypass_secret_cookie,omitempty"`
 	AllowlistIPs []string `json:"allowlist_ips,omitempty"`
-	// blocklist from file: IP/CIDR per line, reload by interval
 	BlocklistFile           string        `json:"blocklist_file,omitempty"`
 	BlocklistReloadInterval caddy.Duration `json:"blocklist_reload_interval,omitempty"`
-	// honeypot: hit path -> block IP
 	HoneypotPaths    []string        `json:"honeypot_paths,omitempty"`
 	HoneypotDuration caddy.Duration  `json:"honeypot_block_duration,omitempty"`
-	// trap: path contains substring -> block
 	TrapPaths []string `json:"trap_paths,omitempty"`
-	// bot: require UA, block bad UA list, optional require Accept
 	RequireUserAgent bool     `json:"require_user_agent,omitempty"`
 	BadUserAgents   []string `json:"bad_user_agents,omitempty"`
 	RequireAccept   bool     `json:"require_accept_header,omitempty"`
-	// max body: reject if Content-Length > N (413 or 444)
 	MaxBodyBytes int64 `json:"max_body_bytes,omitempty"`
-	// per-host rate: key = ip:host
 	PerHostLimit int64 `json:"per_host_limit,omitempty"`
-	// fingerprint rate: key = hash(UA+Accept) per ip
 	FingerprintLimit int64 `json:"fingerprint_limit,omitempty"`
-	// unique URL throttle: scan/cache-bust
 	MaxUniqueURLsPerMinute int64 `json:"max_unique_urls_per_minute,omitempty"`
+	BurstLimit  int64         `json:"burst_limit,omitempty"`
+	BurstWindow caddy.Duration `json:"burst_window,omitempty"`
 
 	store *store
 	logger *zap.Logger
@@ -119,9 +100,7 @@ type Handler struct {
 	globalReqs   atomic.Int64
 	lastMinute   atomic.Int64
 	autoEnabled  atomic.Bool
-	challengeNonce []byte
 
-	// prebuilt for hot path, no alloc
 	whitelistExact   map[string]struct{}
 	whitelistPrefix  []string
 	sensitiveExact   map[string]struct{}
@@ -135,6 +114,7 @@ type Handler struct {
 	wafRuleIdxHeader []int
 	generalPrefixLen int
 	challengePathLen int
+	burstWindowDur   time.Duration
 
 	allowlist     *allowlistChecker
 	blocklist     atomic.Pointer[allowlistChecker]
@@ -142,10 +122,9 @@ type Handler struct {
 	honeypotPrefix []string
 	trapBytes      [][]byte
 	badUABytes     [][]byte
-	rejectBodyBytes []byte // cached body for reject (from RejectBody inline or file)
+	rejectBodyBytes []byte
 }
 
-// WAFRule is a single WAF rule.
 type WAFRule struct {
 	ID     string `json:"id,omitempty"`
 	Type   string `json:"type,omitempty"`
@@ -153,7 +132,6 @@ type WAFRule struct {
 	Action string `json:"action,omitempty"`
 }
 
-// CaddyModule returns module info.
 func (Handler) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
 		ID:  "http.handlers.cortex7",
@@ -161,7 +139,6 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision sets up the handler and prebuilds matchers.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger()
 	if h.store == nil {
@@ -198,6 +175,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.AutoThresholdDisable == 0 {
 		h.AutoThresholdDisable = 500
 	}
+	if h.BurstWindow == 0 {
+		h.BurstWindow = caddy.Duration(10 * time.Second)
+	}
+	h.burstWindowDur = time.Duration(h.BurstWindow)
+	if h.burstWindowDur < time.Second {
+		h.burstWindowDur = 10 * time.Second
+	}
 	if h.ChallengePath == "" {
 		h.ChallengePath = "/.c7c"
 	}
@@ -210,7 +194,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.CookieMaxAge == 0 {
 		h.CookieMaxAge = 3600
 	}
-	// polymorphism lol
 	if h.CookieRandomSuffix {
 		suf := make([]byte, 4)
 		crand.Read(suf)
@@ -238,7 +221,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if h.HoneypotDuration == 0 {
 		h.HoneypotDuration = h.BlockDuration
 	}
-	// allowlist IP/CIDR
 	if len(h.AllowlistIPs) > 0 {
 		var err error
 		h.allowlist, err = buildAllowlist(h.AllowlistIPs)
@@ -246,7 +228,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return err
 		}
 	}
-	// blocklist from file
 	if h.BlocklistFile != "" {
 		bl, err := loadBlocklistFromFile(h.BlocklistFile)
 		if err != nil {
@@ -273,7 +254,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			}()
 		}
 	}
-	// honeypot: exact + prefix
 	h.honeypotExact = make(map[string]struct{}, len(h.HoneypotPaths))
 	for _, p := range h.HoneypotPaths {
 		if p == "" {
@@ -286,7 +266,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 	sort.Slice(h.honeypotPrefix, func(i, j int) bool { return len(h.honeypotPrefix[i]) > len(h.honeypotPrefix[j]) })
-	// trap paths as byte slices
 	for _, s := range h.TrapPaths {
 		if s != "" {
 			h.trapBytes = append(h.trapBytes, []byte(s))
@@ -298,7 +277,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 	if h.CookieName == "" {
-		h.CookieName = "_c7v"
+		h.CookieName = "v"
 	}
 	if h.CookieSecret == "" {
 		b := make([]byte, 32)
@@ -307,13 +286,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 		h.CookieSecret = hex.EncodeToString(b)
 	}
-	h.challengeNonce = make([]byte, 16)
-	if _, err := crand.Read(h.challengeNonce); err != nil {
-		return err
-	}
 	h.generalPrefixLen = len(h.GeneralPrefix)
 
-	// prebuild whitelist: exact set + prefix slice (longest first)
 	h.whitelistExact = make(map[string]struct{}, len(h.WhitelistPaths))
 	for _, p := range h.WhitelistPaths {
 		if strings.Contains(p, "*") {
@@ -330,7 +304,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	sort.Slice(h.whitelistPrefix, func(i, j int) bool { return len(h.whitelistPrefix[i]) > len(h.whitelistPrefix[j]) })
 
-	// prebuild sensitive paths
 	h.sensitiveExact = make(map[string]struct{}, len(h.SensitivePaths))
 	for _, p := range h.SensitivePaths {
 		if p == "" {
@@ -349,7 +322,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		h.sensitiveLimitMap = make(map[string]int64)
 	}
 
-	// precompile WAF rule matches as []byte and rule index
 	for i := range h.WAFRules {
 		m := h.WAFRules[i].Match
 		if m == "" {
@@ -369,20 +341,17 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 		}
 	}
 
-	// start prune loop (use same window for rate-limit buckets)
 	pruneWindow := time.Duration(h.RateLimitWindow)
 	if pruneWindow < time.Second {
 		pruneWindow = time.Minute
 	}
-	burstWindow := 10 * time.Second
 	go func() {
 		t := time.NewTicker(2 * time.Minute)
 		defer t.Stop()
 		for range t.C {
-			h.store.prune(pruneWindow, burstWindow)
+			h.store.prune(pruneWindow, h.burstWindowDur)
 		}
 	}()
-	// challenge token store reset (configurable, default 10m): all cookies invalid, re-challenge
 	go func() {
 		iv := time.Duration(h.ChallengeStoreResetInterval)
 		if iv < time.Minute {
@@ -397,7 +366,6 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// Validate checks config.
 func (h *Handler) Validate() error {
 	if h.SensitiveLimit < 1 {
 		return fmt.Errorf("sensitive_limit must be >= 1")
@@ -417,7 +385,6 @@ func (h *Handler) Validate() error {
 	return nil
 }
 
-// ServeHTTP runs the protection chain; hot path optimized.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	enabled := h.Enabled || h.autoEnabled.Load()
 	if !enabled {
@@ -427,7 +394,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	path := r.URL.Path
 	pathLen := len(path)
 
-	// bypass: secret in header or cookie (constant-time compare)
 	if h.BypassSecret != "" {
 		if h.BypassSecretHeader != "" {
 			if subtleCompare(r.Header.Get(h.BypassSecretHeader), h.BypassSecret) {
@@ -441,7 +407,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// tick global counter (1m for auto_enable), rate-limit bucket (configurable window)
 	now := time.Now()
 	minuteBucket := now.Unix() / 60
 	window := time.Duration(h.RateLimitWindow)
@@ -465,7 +430,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 	h.globalReqs.Add(1)
 
-	// whitelist: exact then prefix
 	if _, ok := h.whitelistExact[path]; ok {
 		return next.ServeHTTP(w, r)
 	}
@@ -475,7 +439,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// realIP once
 	ip := h.realIP(r)
 	if ip == "" {
 		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
@@ -487,7 +450,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return next.ServeHTTP(w, r)
 	}
 
-	// allowlist IP/CIDR: skip all checks
 	if h.allowlist != nil && h.allowlist.contains(ip) {
 		return next.ServeHTTP(w, r)
 	}
@@ -501,7 +463,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	// trap paths: path contains substring -> block IP
+	if h.BurstLimit > 0 {
+		bucketBurst := now.Truncate(h.burstWindowDur).Unix()
+		n := h.store.incReqBurst(ip, bucketBurst)
+		if n > h.BurstLimit {
+			h.store.block(ip, "burst", time.Duration(h.BlockDuration))
+			h.rejectWithReason(w, r, "burst")
+			return nil
+		}
+	}
+
 	for _, b := range h.trapBytes {
 		if indexBytes(*(*[]byte)(unsafe.Pointer(&path)), b) >= 0 {
 			h.store.block(ip, "trap_path", time.Duration(h.HoneypotDuration))
@@ -510,7 +481,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// max body
 	if h.MaxBodyBytes > 0 && r.ContentLength > h.MaxBodyBytes {
 		h.rejectWithCode(w, r, h.maxBodyRejectCode(), "max_body")
 		return nil
@@ -526,7 +496,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// WAF: precompiled byte contains; action block | challenge
 	pathB := *(*[]byte)(unsafe.Pointer(&path))
 	for i, b := range h.wafPathBytes {
 		if indexBytes(pathB, b) >= 0 {
@@ -588,7 +557,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// bot checks: require UA, block bad UA, require Accept
 	if h.RequireUserAgent && r.UserAgent() == "" {
 		h.rejectWithReason(w, r, "no_user_agent")
 		return nil
@@ -607,7 +575,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		return nil
 	}
 
-	// honeypot: hit path -> block IP
 	if _, ok := h.honeypotExact[path]; ok {
 		h.store.block(ip, "honeypot", time.Duration(h.HoneypotDuration))
 		h.rejectWithReason(w, r, "honeypot")
@@ -643,7 +610,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// sensitive path: exact then prefix, single inc per request
 	limit := h.SensitiveLimit
 	if _, ok := h.sensitiveExact[path]; ok {
 		if l, ok := h.sensitiveLimitMap[path]; ok {
@@ -672,7 +638,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// per-host rate limit
 	if h.PerHostLimit > 0 {
 		hostKey := ip + ":" + r.Host
 		n := h.store.incReqKey(hostKey, bucketMin)
@@ -683,7 +648,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// fingerprint rate limit (same UA+Accept pattern per IP)
 	if h.FingerprintLimit > 0 {
 		accept := r.Header.Get("Accept")
 		fpKey := ip + ":" + fmt.Sprintf("%016x", hashPathQuery(ua+accept))
@@ -695,7 +659,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// unique URL throttle (scan/cache-bust)
 	if h.MaxUniqueURLsPerMinute > 0 {
 		pathQuery := path
 		if r.URL.RawQuery != "" {
@@ -709,7 +672,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 	}
 
-	// general rate limit (0 = disabled)
 	if gl := h.getGeneralLimit(); gl > 0 {
 		useGeneral := h.generalPrefixLen == 0 || (pathLen >= h.generalPrefixLen && path[:h.generalPrefixLen] == h.GeneralPrefix)
 		if useGeneral {
@@ -771,7 +733,9 @@ func (h *Handler) rejectWithCode(w http.ResponseWriter, r *http.Request, code in
 	if h.LogBlocks && reason != "" {
 		h.logBlock(r, reason)
 	}
-	h.responseJitter()
+	if reason != "blocked" && reason != "blocklist" {
+		h.responseJitter()
+	}
 	if code <= 0 {
 		code = 444
 	}
@@ -821,7 +785,6 @@ func (h *Handler) getGeneralLimit() int64 {
 	return *h.GeneralLimit
 }
 
-// responseJitter adds random delay to thwart timing/bot fingerprinting
 func (h *Handler) responseJitter() {
 	min, max := h.ResponseJitterMin, h.ResponseJitterMax
 	if min <= 0 || max < min {
@@ -846,13 +809,10 @@ func (h *Handler) serveChallenge(w http.ResponseWriter, r *http.Request, next ca
 	if urlToken == "" {
 		return h.serveChallengePage(w, r)
 	}
-	// URL token derived from IP+nonce+secret so only real browser from this IP gets valid link
-	expectedURL := h.challengeToken(ip)
-	if !subtleCompare(urlToken, expectedURL) {
-		h.reject(w, r)
-		return nil
+	now := time.Now().UnixNano()
+	if !h.store.consumePageToken(urlToken, ip, now) {
+		return h.serveChallengePage(w, r)
 	}
-	// issue unique session token (not derivable), store server-side, bind to IP
 	raw := make([]byte, 32)
 	if _, err := crand.Read(raw); err != nil {
 		h.reject(w, r)
@@ -871,14 +831,6 @@ func (h *Handler) serveChallenge(w http.ResponseWriter, r *http.Request, next ca
 	return nil
 }
 
-// challengeToken derives URL param token (IP+nonce+secret) so only real browser gets valid link
-func (h *Handler) challengeToken(ip string) string {
-	s := fmt.Sprintf("%s:%x:%s", ip, h.challengeNonce, h.CookieSecret)
-	sum := sha256.Sum256([]byte(s))
-	return base64.URLEncoding.EncodeToString(sum[:])[:32]
-}
-
-// verifyChallengeCookie checks cookie against server-side store: token exists, IP match, not expired
 func (h *Handler) verifyChallengeCookie(c *http.Cookie, ip string) bool {
 	if c == nil || c.Value == "" {
 		return false
@@ -925,19 +877,38 @@ func (h *Handler) serveChallengePage(w http.ResponseWriter, r *http.Request) err
 		ip, _, _ = net.SplitHostPort(r.RemoteAddr)
 	}
 	ip = trimIPv4Mapping(ip)
-	token := h.challengeToken(ip)
-	dest := h.ChallengePath + "?t=" + token
-	nonce := base64.StdEncoding.EncodeToString(h.challengeNonce)
-	page := fmt.Sprintf(`<!DOCTYPE html><html><head><meta charset="utf-8"/><meta http-equiv="refresh" content="0;url=%s"/></head><body><script>document.location="%s";</script><noscript><a href="%s">Continue</a></noscript></body></html>`,
-		dest, dest, dest)
+ 	raw := make([]byte, 24)
+	if _, err := crand.Read(raw); err != nil {
+		h.reject(w, r)
+		return nil
+	}
+	pageTok := hex.EncodeToString(raw)
+	now := time.Now()
+	until := now.Add(2 * time.Minute).UnixNano()
+	issuedAt := now.UnixNano()
+	h.store.setPageToken(pageTok, ip, until, issuedAt)
+	path := h.ChallengePath
+	tokB64 := base64.StdEncoding.EncodeToString([]byte(pageTok))
+	page := h.challengePageHTML(path, tokB64)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("X-C7-Nonce", nonce)
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(page))
+	_, _ = w.Write(page)
 	return nil
 }
 
-// TrackFailedAuth is called when auth fails.
+func (h *Handler) challengePageHTML(path, tokB64 string) []byte {
+	const tpl = `<!DOCTYPE html><html><head><meta charset="utf-8"/><title></title></head><body><div id="q" data-r="%s"></div><script>
+(function(){var d=document.getElementById("q");if(!d)return;var r=d.getAttribute("data-r");if(!r)return;
+try{var s=atob(r);if(!s)return;}catch(e){return;}
+if(typeof navigator!="undefined"&&navigator.webdriver===true)return;
+var t=1500+Math.floor(Math.random()*1500);setTimeout(function(){try{location.replace("%s?t="+encodeURIComponent(s));}catch(e){}},t);
+})();</script><noscript><p>Enable JavaScript to continue.</p></noscript></body></html>`
+	pathEsc := strings.ReplaceAll(path, `\`, `\\`)
+	pathEsc = strings.ReplaceAll(pathEsc, `"`, `\"`)
+	return []byte(fmt.Sprintf(tpl, tokB64, pathEsc))
+}
+
 func (h *Handler) TrackFailedAuth(ip string) {
 	if h.store == nil {
 		return
@@ -951,10 +922,8 @@ func (h *Handler) TrackFailedAuth(ip string) {
 
 var _ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 
-// Cortex7CtxKey is the context key for cortex7 handler.
 type Cortex7CtxKey struct{}
 
-// HandlerFromContext returns the cortex7 Handler from context if present.
 func HandlerFromContext(ctx context.Context) *Handler {
 	v := ctx.Value(Cortex7CtxKey{})
 	if v == nil {

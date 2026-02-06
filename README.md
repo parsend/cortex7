@@ -83,6 +83,8 @@ Put `cortex7` first in your `handle` block so it runs before other handlers.
 | `sensitive_limit` | N | Requests/min per sensitive path |
 | `general_prefix` | prefix | Apply general limit only to this path prefix (empty = all) |
 | `general_limit` | N | Requests/min per IP (general); 0 = disable |
+| `burst_limit` | N | Max requests per IP in burst window (0 = off) |
+| `burst_window` | duration | Burst window (default 10s) |
 | `rate_limit_window` | duration | Bucket window for rate limits (default 1m) |
 | `failed_auth_limit` | N | Failed auth events in 15 min → block |
 | `block_duration` | duration | Block TTL for rate-limit hits |
@@ -155,6 +157,7 @@ if h := cortex7.HandlerFromContext(r.Context()); h != nil {
 To have the handler in context, inject it (e.g. via a wrapper or by storing the handler reference where your auth code can access it). The cortex7 handler itself does not set `Cortex7CtxKey`; you need to add it in your setup if you use `HandlerFromContext`.
 
 ---
+
 
 ## Licence and upstream
 

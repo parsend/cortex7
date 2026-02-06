@@ -1,5 +1,3 @@
-// cortex7 in-memory store, sharded for millions RPS. parsend(c0redev)
-
 package cortex7
 
 import (
@@ -12,10 +10,12 @@ const (
 	windowMinute = time.Minute
 	windowAuth   = 15 * time.Minute
 	shardCount   = 256
+	minChallengeDelayNano = 1500 * int64(time.Millisecond)
+	maxChallengeDelayNano = 5 * int64(time.Minute)
 )
 
 type blockEntry struct {
-	until  int64  // unix nano
+	until  int64
 	reason string
 }
 
@@ -29,22 +29,28 @@ type uniqueURLWindow struct {
 	urls  map[uint64]struct{}
 }
 
-// challengeEntry binds issued token to IP and expiry (server-side, not derivable)
 type challengeEntry struct {
 	ip   string
 	until int64
+}
+
+type pageTokenEntry struct {
+	ip       string
+	until    int64
+	issuedAt int64
 }
 
 type shard struct {
 	mu               sync.RWMutex
 	blocked          map[string]blockEntry
 	reqCount         map[string]*windowCount
-	reqBurst         map[string]*windowCount   // ip -> count in short window (anti-flood)
+	reqBurst         map[string]*windowCount
 	reqByPath        map[string]map[string]*windowCount
-	reqByKey         map[string]*windowCount   // per-host, fingerprint
+	reqByKey         map[string]*windowCount
 	failedAuth       map[string]*windowCount
 	uniqueURLs       map[string]*uniqueURLWindow
 	challengeTokens  map[string]challengeEntry
+	pageTokens       map[string]pageTokenEntry
 }
 
 func newShard() *shard {
@@ -57,6 +63,7 @@ func newShard() *shard {
 		failedAuth:      make(map[string]*windowCount, 64),
 		uniqueURLs:      make(map[string]*uniqueURLWindow, 64),
 		challengeTokens: make(map[string]challengeEntry, 128),
+		pageTokens:      make(map[string]pageTokenEntry, 64),
 	}
 }
 
@@ -73,7 +80,6 @@ func newStore() *store {
 	return s
 }
 
-// hashIP returns shard index 0..shardCount-1. no alloc.
 func hashIP(ip string) uint32 {
 	var h uint32
 	for i := 0; i < len(ip); i++ {
@@ -215,7 +221,40 @@ func hashPathQuery(s string) uint64 {
 	return h
 }
 
-// setChallengeToken stores token bound to IP and expiry. maxSize 0 = no limit. returns false if at capacity.
+func (s *store) setPageToken(tok, ip string, until, issuedAt int64) {
+	sh := s.shardByKey(tok)
+	sh.mu.Lock()
+	sh.pageTokens[tok] = pageTokenEntry{ip: ip, until: until, issuedAt: issuedAt}
+	sh.mu.Unlock()
+}
+
+func (s *store) consumePageToken(tok, ip string, now int64) bool {
+	if tok == "" || ip == "" {
+		return false
+	}
+	sh := s.shardByKey(tok)
+	sh.mu.Lock()
+	e, ok := sh.pageTokens[tok]
+	if !ok {
+		sh.mu.Unlock()
+		return false
+	}
+	if now >= e.until || !constantTimeEqual(e.ip, ip) {
+		delete(sh.pageTokens, tok)
+		sh.mu.Unlock()
+		return false
+	}
+	elapsed := now - e.issuedAt
+	if elapsed < minChallengeDelayNano || elapsed > maxChallengeDelayNano {
+		delete(sh.pageTokens, tok)
+		sh.mu.Unlock()
+		return false
+	}
+	delete(sh.pageTokens, tok)
+	sh.mu.Unlock()
+	return true
+}
+
 func (s *store) setChallengeToken(token, ip string, until int64, maxSize int64) bool {
 	sh := s.shardByKey(token)
 	sh.mu.Lock()
@@ -232,7 +271,6 @@ func (s *store) setChallengeToken(token, ip string, until int64, maxSize int64) 
 	return true
 }
 
-// validateChallengeToken checks token exists, IP matches, not expired. constant-time path.
 func (s *store) validateChallengeToken(token, ip string, nowNano int64) bool {
 	if token == "" || ip == "" {
 		return false
@@ -355,6 +393,11 @@ func (s *store) prune(rateLimitWindow, burstWindow time.Duration) {
 			if nowNano >= e.until {
 				delete(sh.challengeTokens, token)
 				s.challengeTokenCount.Add(-1)
+			}
+		}
+		for tok, e := range sh.pageTokens {
+			if nowNano >= e.until {
+				delete(sh.pageTokens, tok)
 			}
 		}
 		sh.mu.Unlock()

@@ -60,6 +60,16 @@ func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error)
 				n, _ := strconv.ParseInt(h.Val(), 10, 64)
 				handler.GeneralLimit = &n
 			}
+		case "burst_limit":
+			if h.NextArg() {
+				n, _ := strconv.ParseInt(h.Val(), 10, 64)
+				handler.BurstLimit = n
+			}
+		case "burst_window":
+			if h.NextArg() {
+				d, _ := parseDuration(h.Val())
+				handler.BurstWindow = caddy.Duration(d)
+			}
 		case "rate_limit_window":
 			if h.NextArg() {
 				d, _ := parseDuration(h.Val())
